@@ -139,7 +139,12 @@ class MainActivity : Activity() {
         content.addView(strengthSeek)
 
         content.addView(sectionTitle("UPSCALE OUTPUT"))
-        scaleSpinner = spinner(listOf("Original size", "2× upscale", "4× upscale", "4K (long edge 3840 px)"))
+        scaleSpinner = spinner(listOf(
+            "Original size",
+            "2× upscale (max edge 4096 px)",
+            "4× upscale (max edge 4096 px)",
+            "4K (long edge 3840 px)"
+        ))
         content.addView(scaleSpinner)
         content.addView(sectionTitle("EXPORT FORMAT"))
         formatSpinner = spinner(listOf("JPG", "PNG", "WebP"))
@@ -234,17 +239,21 @@ class MainActivity : Activity() {
                 }
             } catch (e: OutOfMemoryError) {
                 runOnUiThread {
+                    result = null
+                    afterView.setImageDrawable(null)
                     status.text = "Not enough memory for this output. Try Original size or 2×."
                     progressBar.visibility = View.GONE
                     enhanceButton.isEnabled = true
-                    saveButton.isEnabled = true
+                    saveButton.isEnabled = false
                 }
             } catch (e: Exception) {
                 runOnUiThread {
+                    result = null
+                    afterView.setImageDrawable(null)
                     status.text = "Could not enhance image: ${e.message ?: "unknown error"}"
                     progressBar.visibility = View.GONE
                     enhanceButton.isEnabled = true
-                    saveButton.isEnabled = true
+                    saveButton.isEnabled = false
                 }
             }
         }
@@ -287,16 +296,27 @@ class MainActivity : Activity() {
             for (x in 1 until w - 1) {
                 val i = y * w + x
                 val c = pixels[i]
-                val neighbors = intArrayOf(pixels[i - w], pixels[i + w], pixels[i - 1], pixels[i + 1])
-                fun channel(extract: (Int) -> Int): Int {
-                    val center = extract(c).toFloat()
-                    val avg = neighbors.map { extract(it) }.average().toFloat()
-                    return (center + (center - avg) * amount * 2.0f).roundToInt().coerceIn(0, 255)
-                }
-                out[i] = Color.argb(Color.alpha(c), channel(Color::red), channel(Color::green), channel(Color::blue))
+                val up = pixels[i - w]
+                val down = pixels[i + w]
+                val left = pixels[i - 1]
+                val right = pixels[i + 1]
+                out[i] = Color.argb(
+                    Color.alpha(c),
+                    sharpenChannel(Color.red(c), Color.red(up), Color.red(down), Color.red(left), Color.red(right), amount),
+                    sharpenChannel(Color.green(c), Color.green(up), Color.green(down), Color.green(left), Color.green(right), amount),
+                    sharpenChannel(Color.blue(c), Color.blue(up), Color.blue(down), Color.blue(left), Color.blue(right), amount)
+                )
             }
         }
         return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { it.setPixels(out, 0, w, 0, 0, w, h) }
+    }
+
+    private fun sharpenChannel(
+        center: Int, up: Int, down: Int, left: Int, right: Int, amount: Float
+    ): Int {
+        val average = (up + down + left + right) / 4f
+        return (center + (center - average) * amount * 2f)
+            .roundToInt().coerceIn(0, 255)
     }
 
     private fun calculateSample(width: Int, height: Int, maxEdge: Int): Int {
@@ -358,9 +378,39 @@ class MainActivity : Activity() {
 
     private fun spinner(items: List<String>): Spinner {
         val s = Spinner(this)
-        s.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, items).also {
-            it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        val adapter = object : ArrayAdapter<String>(
+            this, android.R.layout.simple_spinner_item, items
+        ) {
+            override fun getView(
+                position: Int,
+                convertView: View?,
+                parent: android.view.ViewGroup
+            ): View {
+                return super.getView(position, convertView, parent).also { view ->
+                    (view as? TextView)?.apply {
+                        setTextColor(white)
+                        textSize = 14f
+                    }
+                }
+            }
+
+            override fun getDropDownView(
+                position: Int,
+                convertView: View?,
+                parent: android.view.ViewGroup
+            ): View {
+                return super.getDropDownView(position, convertView, parent).also { view ->
+                    (view as? TextView)?.apply {
+                        setTextColor(white)
+                        setBackgroundColor(panel)
+                        textSize = 14f
+                        setPadding(dp(12), dp(12), dp(12), dp(12))
+                    }
+                }
+            }
         }
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        s.adapter = adapter
         s.setPadding(dp(8), dp(4), dp(8), dp(4))
         return s
     }
