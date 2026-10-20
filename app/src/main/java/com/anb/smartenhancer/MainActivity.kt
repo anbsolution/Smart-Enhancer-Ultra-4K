@@ -16,7 +16,7 @@ import android.provider.MediaStore
 import android.view.Gravity
 import android.view.View
 import android.widget.*
-import java.io.OutputStream
+import java.io.IOException
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -323,14 +323,23 @@ class MainActivity : Activity() {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/SmartEnhancer")
             }
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                ?: throw IllegalStateException("Could not create output file")
-            contentResolver.openOutputStream(uri).use { stream ->
-                val fmt = when (format) {
-                    "PNG" -> Bitmap.CompressFormat.PNG
-                    "WebP" -> if (Build.VERSION.SDK_INT >= 30) Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.WEBP
-                    else -> Bitmap.CompressFormat.JPEG
+                ?: throw IOException("Could not create output file")
+            try {
+                val outputStream = contentResolver.openOutputStream(uri)
+                    ?: throw IOException("Could not open output stream")
+                outputStream.use { stream ->
+                    val fmt = when (format) {
+                        "PNG" -> Bitmap.CompressFormat.PNG
+                        "WebP" -> if (Build.VERSION.SDK_INT >= 30) Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.WEBP
+                        else -> Bitmap.CompressFormat.JPEG
+                    }
+                    if (!bmp.compress(fmt, if (format == "PNG") 100 else 94, stream)) {
+                        throw IOException("Bitmap compression failed")
+                    }
                 }
-                bmp.compress(fmt, if (format == "PNG") 100 else 94, stream)
+            } catch (e: Exception) {
+                contentResolver.delete(uri, null, null)
+                throw e
             }
             status.text = "Saved to Pictures/SmartEnhancer • $format"
         } catch (e: Exception) {
