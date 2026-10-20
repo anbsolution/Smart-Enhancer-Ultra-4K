@@ -1,29 +1,37 @@
-# Smart Enhancer Ultra 4K — v1.2
+# Smart Enhancer Ultra 4K
 
-## v1.2 upgrades
-- Image processing runs on a background worker thread, keeping the UI responsive.
-- Processing indicator and disabled action buttons prevent duplicate jobs.
-- More defensive output sizing to reduce integer overflow risk.
-- Maximum output long edge capped at 4096 px to reduce memory pressure.
-- Save remains disabled until an enhanced result exists.
+Native Android image enhancement app with a dark UI, bounded working-image decoding, offline contrast/sharpening, capped scaling, and user-selected export destination.
 
-## Features
-- Android image picker and side-by-side preview
-- Toggle original/enhanced preview
-- Fast contrast + sharpening filter
-- Stronger offline heuristic "AI Enhance" mode
-- Adjustable enhancement strength
-- Original, 2×, 4× and 4K long-edge output
-- JPG, PNG, WebP export
-- Reset controls
-- GitHub Actions APK workflow
+## Implemented features
 
-## Build APK from your phone
-1. Extract this ZIP.
-2. Upload the folder contents to the root of a GitHub repository.
-3. Open **Actions** → **Build Android APK** → **Run workflow**.
-4. Download `SmartEnhancerUltra4K-debug-apk` from the successful workflow run.
-5. Extract and install `app-debug.apk`.
+- Android Storage Access Framework image picker and save dialog; no broad storage permission is requested.
+- EXIF orientation correction for rotated/flipped camera photos when metadata is available.
+- Original working preview and enhanced preview with toggle.
+- Fast offline contrast/sharpening mode.
+- Stronger offline heuristic mode. **This is not a trained neural or generative AI model.**
+- Adjustable strength; changing enhancement settings invalidates stale output so it cannot accidentally be saved.
+- Standard working output (source is decoded with a maximum 2048 px long edge), 2×, 4× (output edge capped at 4096 px), and 4K long-edge output (3840 px).
+- JPG, PNG, and WebP export, with stream and encoder failure handling.
+- Background image decoding, processing, and saving; controls are locked while an operation is active.
+- Pure Kotlin image-sizing unit tests, Android lint, and CI debug APK build.
 
-## Important limitation
-This project does not yet include a trained AI super-resolution model. The "AI Enhance" mode is a stronger offline filter, not generative or neural AI. True restoration requires a properly licensed model and Android inference runtime. Build has not been run/verified in this environment.
+## Build and validation
+
+GitHub Actions runs:
+
+1. `testDebugUnitTest`
+2. `lintDebug`
+3. `assembleDebug`
+
+The APK artifact is uploaded only if all three tasks succeed. Validation reports are uploaded even when the run fails (when reports exist).
+
+For a local Android build, use Android Studio with JDK 17, Android SDK platform 35, and Gradle 8.9. Run `gradle testDebugUnitTest lintDebug assembleDebug` from the project root.
+
+See [TESTING.md](TESTING.md) for the release-gate test matrix and manual device checklist.
+
+## Important limitations
+
+- The app uses deterministic offline filters; no neural super-resolution model is bundled.
+- Upscaling enlarges the working image and does not guarantee recovery of missing details.
+- To reduce memory pressure, source images are decoded to a working preview with a long edge of at most 2048 px. Output scaling is capped at 4096 px on the long edge.
+- A successful CI build is not equivalent to live-device validation. Test image selection, each export format, dimensions, cancellation, and large-image behavior on a real Android device before publishing a release.

@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Android CI and APK
 on:
   workflow_dispatch:
   push:
@@ -6,7 +6,7 @@ on:
 permissions:
   contents: read
 jobs:
-  build:
+  verify-and-build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
@@ -16,14 +16,26 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+          cache: gradle
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Build debug APK
-        run: gradle assembleDebug
+      - name: Run unit tests, lint, and debug build
+        run: gradle --no-daemon --stacktrace testDebugUnitTest lintDebug assembleDebug
+      - name: Upload validation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartEnhancerUltra4K-validation-reports
+          path: |
+            app/build/reports/tests/testDebugUnitTest/**
+            app/build/reports/lint-results-debug.html
+          if-no-files-found: ignore
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: SmartEnhancerUltra4K-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

@@ -1,30 +1,31 @@
 package com.anb.smartenhancer
 
 import android.app.Activity
-import android.content.ContentValues
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.Rect
+import android.graphics.Matrix
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.provider.MediaStore
-import android.view.Gravity
+import android.os.Build
 import android.view.View
 import android.widget.*
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.exifinterface.media.ExifInterface
 import java.io.IOException
-import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.roundToInt
 import java.util.concurrent.Executors
+import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
     private var original: Bitmap? = null
     private var result: Bitmap? = null
+    private var pendingSaveBitmap: Bitmap? = null
+    private var operationId = 0L
+    private var busy = false
+
     private lateinit var beforeView: ImageView
     private lateinit var afterView: ImageView
     private lateinit var status: TextView
@@ -34,18 +35,22 @@ class MainActivity : Activity() {
     private lateinit var strengthSeek: SeekBar
     private lateinit var strengthLabel: TextView
     private lateinit var compareButton: Button
-    private var showingOriginal = false
-    private var selectedMode = "Fast Enhance"
-    private val worker = Executors.newSingleThreadExecutor()
+    private lateinit var chooseButton: Button
     private lateinit var enhanceButton: Button
     private lateinit var saveButton: Button
+    private lateinit var resetButton: Button
     private lateinit var progressBar: ProgressBar
+
+    @Volatile private var selectedMode = "Fast Enhance"
+    private var showingOriginal = false
+    private val worker = Executors.newSingleThreadExecutor()
 
     private val purple = Color.rgb(124, 92, 255)
     private val bg = Color.rgb(16, 17, 26)
     private val panel = Color.rgb(29, 31, 45)
     private val white = Color.rgb(245, 246, 255)
     private val muted = Color.rgb(171, 175, 197)
+    private val buttonPanel = Color.rgb(48, 51, 70)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -72,26 +77,20 @@ class MainActivity : Activity() {
             setPadding(0, 0, 0, dp(18))
         })
 
-        val pick = button("＋   Choose an image")
-        content.addView(pick)
-        pick.setOnClickListener {
-            val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                addCategory(Intent.CATEGORY_OPENABLE)
-                type = "image/*"
-            }
-            startActivityForResult(i, 100)
-        }
+        chooseButton = button("＋   Choose an image")
+        content.addView(chooseButton)
+        chooseButton.setOnClickListener { chooseImage() }
 
         content.addView(sectionTitle("PREVIEW"))
+        content.addView(label("Working preview is limited to a 2048 px long edge for memory safety.", 11, muted, false))
         val previews = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        beforeView = imagePanel("Original")
-        afterView = imagePanel("Enhanced")
+        beforeView = imagePanel("Original working preview")
+        afterView = imagePanel("Enhanced preview")
         previews.addView(beforeView, LinearLayout.LayoutParams(0, dp(170), 1f).apply { marginEnd = dp(6) })
         previews.addView(afterView, LinearLayout.LayoutParams(0, dp(170), 1f).apply { marginStart = dp(6) })
         content.addView(previews)
-        compareButton = button("⇄   Toggle original / enhanced").apply {
-            setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.rgb(48, 51, 70)))
-        }
+
+        compareButton = button("⇄   Toggle original / enhanced", buttonPanel)
         content.addView(compareButton)
         compareButton.setOnClickListener {
             val src = original
@@ -108,18 +107,21 @@ class MainActivity : Activity() {
         content.addView(sectionTitle("ENHANCEMENT MODE"))
         modeGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
         val fast = RadioButton(this).apply {
-            text = "Fast Enhance  ·  offline filters"
-            setTextColor(white); textSize = 14f; isChecked = true; id = View.generateViewId()
+            text = "Fast Enhance · offline filters"
+            setTextColor(white); textSize = 14f; id = View.generateViewId(); isChecked = true
         }
-        val ai = RadioButton(this).apply {
-            text = "AI Enhance  ·  smart detail approximation"
+        val smart = RadioButton(this).apply {
+            text = "AI Enhance · heuristic filters (not neural AI)"
             setTextColor(white); textSize = 14f; id = View.generateViewId()
         }
-        modeGroup.addView(fast); modeGroup.addView(ai)
+        modeGroup.addView(fast)
+        modeGroup.addView(smart)
         modeGroup.setOnCheckedChangeListener { _, checked ->
-            selectedMode = if (checked == ai.id) "AI Enhance" else "Fast Enhance"
+            selectedMode = if (checked == smart.id) "AI Enhance" else "Fast Enhance"
+            invalidateResultForSettingsChange()
         }
         content.addView(modeGroup)
+
         content.addView(sectionTitle("ENHANCEMENT STRENGTH"))
         strengthLabel = label("Strength: 65%", 13, muted, false)
         content.addView(strengthLabel)
@@ -132,6 +134,7 @@ class MainActivity : Activity() {
         strengthSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                 strengthLabel.text = "Strength: ${progress.coerceAtLeast(10)}%"
+                if (fromUser) invalidateResultForSettingsChange()
             }
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
             override fun onStopTrackingTouch(seekBar: SeekBar?) {}
@@ -140,12 +143,19 @@ class MainActivity : Activity() {
 
         content.addView(sectionTitle("UPSCALE OUTPUT"))
         scaleSpinner = spinner(listOf(
-            "Original size",
-            "2× upscale (max edge 4096 px)",
-            "4× upscale (max edge 4096 px)",
-            "4K (long edge 3840 px)"
+            "Standard (working size, max 2048 px)",
+            "2× upscale (output capped at 4096 px)",
+            "4× upscale (output capped at 4096 px)",
+            "4K output (long edge 3840 px)"
         ))
+        scaleSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (position != 0) invalidateResultForSettingsChange()
+            }
+        }
         content.addView(scaleSpinner)
+
         content.addView(sectionTitle("EXPORT FORMAT"))
         formatSpinner = spinner(listOf("JPG", "PNG", "WebP"))
         content.addView(formatSpinner)
@@ -161,307 +171,401 @@ class MainActivity : Activity() {
         content.addView(progressBar, LinearLayout.LayoutParams(-1, dp(5)).apply { bottomMargin = dp(10) })
         enhanceButton.setOnClickListener { enhance() }
 
-        saveButton = button("↓   Save enhanced image").apply {
-            setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.rgb(48, 51, 70)))
-        }
+        saveButton = button("↓   Save enhanced image", buttonPanel)
         content.addView(saveButton)
-        saveButton.setOnClickListener { saveImage() }
         saveButton.isEnabled = false
+        saveButton.setOnClickListener { saveImage() }
 
-        val reset = button("↺   Reset image and settings").apply {
-            setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.rgb(48, 51, 70)))
-        }
-        content.addView(reset)
-        reset.setOnClickListener {
-            original = null
-            result = null
-            showingOriginal = false
-            beforeView.setImageDrawable(null)
-            afterView.setImageDrawable(null)
-            scaleSpinner.setSelection(0)
-            formatSpinner.setSelection(0)
-            strengthSeek.progress = 65
-            modeGroup.check(modeGroup.getChildAt(0).id)
-            status.text = "Reset complete • choose another image."
-            saveButton.isEnabled = false
-        }
+        resetButton = button("↺   Reset image and settings", buttonPanel)
+        content.addView(resetButton)
+        resetButton.setOnClickListener { resetImageAndSettings() }
 
-        status = label("Choose an image to get started.", 13, muted, false)
-        status.setPadding(0, dp(14), 0, 0)
+        status = label("Choose an image to get started.", 13, muted, false).apply {
+            setPadding(0, dp(14), 0, 0)
+        }
         content.addView(status)
-
         content.addView(label(
-            "Note: AI Enhance currently uses an offline smart-filter approximation, not a trained generative AI model. It can improve sharpness and contrast, but cannot reliably recreate details that were never captured. A real AI super-resolution model can be added as a separate model integration.",
+            "AI Enhance is an offline contrast/sharpening approximation, not a trained AI model. Upscaling enlarges pixels; it cannot reliably restore detail that was never captured.",
             12, muted, false
         ).apply { setPadding(0, dp(16), 0, 0) })
 
         setContentView(root)
+        if (Build.VERSION.SDK_INT >= 30) {
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+            ViewCompat.setOnApplyWindowInsetsListener(root) { view, windowInsets ->
+                val bars = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
+                view.setPadding(
+                    dp(18) + bars.left,
+                    dp(18) + bars.top,
+                    dp(18) + bars.right,
+                    dp(22) + bars.bottom
+                )
+                windowInsets
+            }
+            ViewCompat.requestApplyInsets(root)
+        }
+        updateEnabledState()
+    }
+
+    private fun chooseImage() {
+        if (busy) return
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "image/*"
+        }
+        try {
+            startActivityForResult(intent, REQUEST_PICK_IMAGE)
+        } catch (e: Exception) {
+            status.text = "Could not open image picker: ${e.message ?: "unknown error"}"
+        }
+    }
+
+    private fun loadImage(uri: Uri) {
+        val token = ++operationId
+        clearCurrentImages()
+        setBusy(true)
+        status.text = "Loading image safely…"
+        worker.execute {
+            var decoded: Bitmap? = null
+            var error: Exception? = null
+            try {
+                decoded = decodeWorkingBitmap(uri)
+            } catch (e: Exception) {
+                error = e
+            } catch (e: OutOfMemoryError) {
+                error = IOException("Image is too large for available memory", e)
+            }
+            val loaded = decoded
+            val failure = error
+            runOnUiThread {
+                if (isFinishing || isDestroyed || token != operationId) {
+                    loaded?.recycle()
+                    return@runOnUiThread
+                }
+                if (failure != null || loaded == null) {
+                    status.text = "Image open failed: ${failure?.message ?: "unsupported image"}"
+                    setBusy(false)
+                    return@runOnUiThread
+                }
+                original = loaded
+                beforeView.setImageBitmap(loaded)
+                afterView.setImageDrawable(null)
+                status.text = "Image loaded • ${loaded.width} × ${loaded.height} px working preview"
+                setBusy(false)
+            }
+        }
+    }
+
+    private fun decodeWorkingBitmap(uri: Uri): Bitmap {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        contentResolver.openInputStream(uri)?.use { input ->
+            BitmapFactory.decodeStream(input, null, bounds)
+        } ?: throw IOException("Could not open selected image")
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) throw IOException("Unsupported or corrupt image")
+        val sample = ImageSizing.calculateInSampleSize(bounds.outWidth, bounds.outHeight)
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sample
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        val decoded = contentResolver.openInputStream(uri)?.use { input ->
+            BitmapFactory.decodeStream(input, null, options)
+        } ?: throw IOException("Image decoder returned no bitmap")
+
+        val exif = try {
+            contentResolver.openInputStream(uri)?.use { input -> ExifInterface(input) }
+        } catch (_: Exception) {
+            null
+        }
+        val rotation = exif?.rotationDegrees ?: 0
+        val flipped = exif?.isFlipped == true
+        if (rotation == 0 && !flipped) return decoded
+
+        val matrix = Matrix().apply {
+            if (flipped) preScale(-1f, 1f)
+            if (rotation != 0) postRotate(rotation.toFloat())
+        }
+        val oriented = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+        if (oriented !== decoded) decoded.recycle()
+        return oriented
     }
 
     private fun enhance() {
         val src = original ?: run { toast("Pehle image choose karein."); return }
+        if (busy) return
+        val token = ++operationId
         val mode = selectedMode
         val strengthPercent = strengthSeek.progress.coerceAtLeast(10)
         val strength = (strengthPercent / 65f).coerceIn(0.15f, 1.55f)
-        val scaleChoice = scaleSpinner.selectedItemPosition
-        enhanceButton.isEnabled = false
-        saveButton.isEnabled = false
-        progressBar.visibility = View.VISIBLE
-        progressBar.isIndeterminate = true
-        status.text = "Processing in background… app remains responsive."
+        val outputMode = when (scaleSpinner.selectedItemPosition) {
+            1 -> ImageSizing.OutputMode.TWO_X
+            2 -> ImageSizing.OutputMode.FOUR_X
+            3 -> ImageSizing.OutputMode.FOUR_K
+            else -> ImageSizing.OutputMode.STANDARD
+        }
+        setBusy(true)
+        status.text = "Enhancing in background…"
         worker.execute {
+            var filtered: Bitmap? = null
+            var output: Bitmap? = null
+            var errorMessage: String? = null
+            var outOfMemory = false
             try {
-                val filtered = if (mode == "AI Enhance") smartEnhance(src, strength) else fastEnhance(src, strength)
-                val target = when (scaleChoice) {
-                    1 -> dimensions((filtered.width.toLong() * 2).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                                    (filtered.height.toLong() * 2).coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
-                    2 -> dimensions((filtered.width.toLong() * 4).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                                    (filtered.height.toLong() * 4).coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
-                    3 -> {
-                        val longEdge = max(filtered.width, filtered.height)
-                        val factor = 3840f / longEdge
-                        if (longEdge >= 3840) Pair(filtered.width, filtered.height)
-                        else dimensions((filtered.width * factor).roundToInt(), (filtered.height * factor).roundToInt())
-                    }
-                    else -> Pair(filtered.width, filtered.height)
+                filtered = enhanceBitmap(src, strength, mode == "AI Enhance")
+                val target = ImageSizing.outputSize(filtered.width, filtered.height, outputMode)
+                output = if (target.width == filtered.width && target.height == filtered.height) {
+                    filtered
+                } else {
+                    Bitmap.createScaledBitmap(filtered, target.width, target.height, true)
                 }
-                val output = if (target.first == filtered.width && target.second == filtered.height) filtered
-                    else Bitmap.createScaledBitmap(filtered, target.first, target.second, true)
-                runOnUiThread {
-                    result = output
-                    afterView.setImageBitmap(output)
-                    showingOriginal = false
-                    compareButton.text = "⇄   Toggle original / enhanced"
-                    status.text = "Done • ${output.width} × ${output.height} px • $mode • $strengthPercent% strength"
-                    progressBar.visibility = View.GONE
-                    enhanceButton.isEnabled = true
-                    saveButton.isEnabled = true
-                }
+                if (output !== filtered) filtered.recycle()
+                filtered = null
             } catch (e: OutOfMemoryError) {
-                runOnUiThread {
-                    result = null
-                    afterView.setImageDrawable(null)
-                    status.text = "Not enough memory for this output. Try Original size or 2×."
-                    progressBar.visibility = View.GONE
-                    enhanceButton.isEnabled = true
-                    saveButton.isEnabled = false
-                }
+                outOfMemory = true
+                errorMessage = "Not enough memory. Try Standard or 2× output."
             } catch (e: Exception) {
-                runOnUiThread {
+                errorMessage = e.message ?: "unknown processing error"
+            } finally {
+                filtered?.let { if (!it.isRecycled) it.recycle() }
+            }
+            val completed = output
+            val failure = errorMessage
+            runOnUiThread {
+                if (isFinishing || isDestroyed || token != operationId) {
+                    completed?.let { if (!it.isRecycled) it.recycle() }
+                    return@runOnUiThread
+                }
+                if (completed == null) {
                     result = null
                     afterView.setImageDrawable(null)
-                    status.text = "Could not enhance image: ${e.message ?: "unknown error"}"
-                    progressBar.visibility = View.GONE
-                    enhanceButton.isEnabled = true
-                    saveButton.isEnabled = false
+                    status.text = if (outOfMemory) failure ?: "Not enough memory." else "Could not enhance image: ${failure ?: "unknown error"}"
+                    setBusy(false)
+                    return@runOnUiThread
                 }
+                val oldResult = result
+                result = completed
+                afterView.setImageBitmap(completed)
+                oldResult?.let { old -> if (old !== completed && !old.isRecycled) old.recycle() }
+                showingOriginal = false
+                compareButton.text = "⇄   Toggle original / enhanced"
+                status.text = "Done • ${completed.width} × ${completed.height} px • $mode • $strengthPercent% strength"
+                setBusy(false)
             }
         }
     }
 
-    override fun onDestroy() {
-        worker.shutdown()
-        super.onDestroy()
-    }
-
-    private fun fastEnhance(src: Bitmap, strength: Float = 1f): Bitmap {
-        val w = src.width; val h = src.height
-        val input = IntArray(w * h)
-        src.getPixels(input, 0, w, 0, 0, w, h)
-        val output = IntArray(input.size)
-        for (i in input.indices) {
-            val c = input[i]
-            val r = Color.red(c); val g = Color.green(c); val b = Color.blue(c)
-            fun adjust(v: Int): Int = ((v - 128) * (1f + 0.16f * strength) + 128 + (v - 128) * 0.06f * strength).roundToInt().coerceIn(0, 255)
-            output[i] = Color.argb(Color.alpha(c), adjust(r), adjust(g), adjust(b))
+    /** Single-pass contrast plus unsharp-mask approximation; pixel math is covered by JVM tests. */
+    private fun enhanceBitmap(src: Bitmap, strength: Float, stronger: Boolean): Bitmap {
+        val width = src.width
+        val height = src.height
+        val input = IntArray(Math.multiplyExact(width, height))
+        src.getPixels(input, 0, width, 0, 0, width, height)
+        val outputPixels = PixelEnhancer.transformArgb(input, width, height, strength, stronger)
+        return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
+            it.setPixels(outputPixels, 0, width, 0, 0, width, height)
         }
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        out.setPixels(output, 0, w, 0, 0, w, h)
-        return sharpen(out, 0.38f * strength)
-    }
-
-    // Offline heuristic mode: stronger contrast and sharpening, not a trained neural network.
-    private fun smartEnhance(src: Bitmap, strength: Float): Bitmap {
-        val filtered = fastEnhance(src, strength * 1.15f)
-        return sharpen(filtered, 0.72f * strength)
-    }
-
-    private fun sharpen(src: Bitmap, amount: Float): Bitmap {
-        val w = src.width; val h = src.height
-        if (w < 3 || h < 3) return src
-        val pixels = IntArray(w * h)
-        src.getPixels(pixels, 0, w, 0, 0, w, h)
-        val out = pixels.clone()
-        for (y in 1 until h - 1) {
-            for (x in 1 until w - 1) {
-                val i = y * w + x
-                val c = pixels[i]
-                val up = pixels[i - w]
-                val down = pixels[i + w]
-                val left = pixels[i - 1]
-                val right = pixels[i + 1]
-                out[i] = Color.argb(
-                    Color.alpha(c),
-                    sharpenChannel(Color.red(c), Color.red(up), Color.red(down), Color.red(left), Color.red(right), amount),
-                    sharpenChannel(Color.green(c), Color.green(up), Color.green(down), Color.green(left), Color.green(right), amount),
-                    sharpenChannel(Color.blue(c), Color.blue(up), Color.blue(down), Color.blue(left), Color.blue(right), amount)
-                )
-            }
-        }
-        return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { it.setPixels(out, 0, w, 0, 0, w, h) }
-    }
-
-    private fun sharpenChannel(
-        center: Int, up: Int, down: Int, left: Int, right: Int, amount: Float
-    ): Int {
-        val average = (up + down + left + right) / 4f
-        return (center + (center - average) * amount * 2f)
-            .roundToInt().coerceIn(0, 255)
-    }
-
-    private fun calculateSample(width: Int, height: Int, maxEdge: Int): Int {
-        var sample = 1
-        while (max(width, height) / (sample * 2) >= maxEdge) sample *= 2
-        return sample.coerceAtLeast(1)
-    }
-
-    private fun dimensions(w: Int, h: Int): Pair<Int, Int> {
-        val maxDimension = 4096
-        val factor = min(1f, maxDimension.toFloat() / max(w, h))
-        return Pair(max(1, (w * factor).roundToInt()), max(1, (h * factor).roundToInt()))
     }
 
     private fun saveImage() {
-        val bmp = result ?: run { toast("Pehle image enhance karein."); return }
+        val bitmap = result ?: run { toast("Pehle image enhance karein."); return }
+        if (busy) return
+        pendingSaveBitmap = bitmap
         val format = formatSpinner.selectedItem.toString()
-        val mime = when (format) { "PNG" -> "image/png"; "WebP" -> "image/webp"; else -> "image/jpeg" }
         val ext = when (format) { "PNG" -> "png"; "WebP" -> "webp"; else -> "jpg" }
+        val mime = when (format) { "PNG" -> "image/png"; "WebP" -> "image/webp"; else -> "image/jpeg" }
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = mime
+            putExtra(Intent.EXTRA_TITLE, "SmartEnhancer_${System.currentTimeMillis()}.$ext")
+        }
+        setBusy(true)
+        status.text = "Choose where to save the enhanced image."
         try {
-            val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, "SmartEnhancer_${System.currentTimeMillis()}.$ext")
-                put(MediaStore.Images.Media.MIME_TYPE, mime)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/SmartEnhancer")
-            }
-            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                ?: throw IOException("Could not create output file")
+            startActivityForResult(intent, REQUEST_SAVE_IMAGE)
+        } catch (e: Exception) {
+            pendingSaveBitmap = null
+            setBusy(false)
+            status.text = "Could not open save dialog: ${e.message ?: "unknown error"}"
+        }
+    }
+
+    private fun writeImage(uri: Uri, bitmap: Bitmap) {
+        val format = formatSpinner.selectedItem.toString()
+        val token = ++operationId
+        worker.execute {
+            var failure: String? = null
             try {
-                val outputStream = contentResolver.openOutputStream(uri)
-                    ?: throw IOException("Could not open output stream")
-                outputStream.use { stream ->
-                    val fmt = when (format) {
+                val output = contentResolver.openOutputStream(uri)
+                    ?: throw IOException("Could not open destination stream")
+                output.use { stream ->
+                    val compressFormat = when (format) {
                         "PNG" -> Bitmap.CompressFormat.PNG
                         "WebP" -> if (Build.VERSION.SDK_INT >= 30) Bitmap.CompressFormat.WEBP_LOSSY else Bitmap.CompressFormat.WEBP
                         else -> Bitmap.CompressFormat.JPEG
                     }
-                    if (!bmp.compress(fmt, if (format == "PNG") 100 else 94, stream)) {
-                        throw IOException("Bitmap compression failed")
+                    val quality = if (format == "PNG") 100 else 94
+                    if (!bitmap.compress(compressFormat, quality, stream)) {
+                        throw IOException("Image encoder failed")
                     }
+                    stream.flush()
                 }
+            } catch (e: OutOfMemoryError) {
+                failure = "Not enough memory to export this image"
+                try { android.provider.DocumentsContract.deleteDocument(contentResolver, uri) } catch (_: Exception) {}
             } catch (e: Exception) {
-                contentResolver.delete(uri, null, null)
-                throw e
+                failure = e.message ?: "unknown save error"
+                try { android.provider.DocumentsContract.deleteDocument(contentResolver, uri) } catch (_: Exception) {}
             }
-            status.text = "Saved to Pictures/SmartEnhancer • $format"
-        } catch (e: Exception) {
-            status.text = "Save failed: ${e.message ?: "unknown error"}"
+            val message = failure
+            runOnUiThread {
+                if (isFinishing || isDestroyed || token != operationId) return@runOnUiThread
+                status.text = if (message == null) "Image saved successfully • $format" else "Save failed: $message"
+                pendingSaveBitmap = null
+                setBusy(false)
+            }
         }
     }
 
-    private fun imagePanel(caption: String): ImageView {
-        return ImageView(this).apply {
-            setBackgroundColor(panel)
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            contentDescription = caption
-            setPadding(dp(4), dp(4), dp(4), dp(4))
-        }
+    private fun resetImageAndSettings() {
+        if (busy) return
+        operationId++
+        clearCurrentImages()
+        scaleSpinner.setSelection(0)
+        formatSpinner.setSelection(0)
+        strengthSeek.progress = 65
+        modeGroup.check(modeGroup.getChildAt(0).id)
+        status.text = "Reset complete • choose another image."
+        setBusy(false)
+    }
+
+    private fun invalidateResultForSettingsChange() {
+        if (!::status.isInitialized || busy || result == null) return
+        val previousResult = result
+        result = null
+        afterView.setImageDrawable(null)
+        previousResult?.let { if (!it.isRecycled) it.recycle() }
+        showingOriginal = false
+        saveButton.isEnabled = false
+        status.text = "Settings changed • enhance again before saving."
+    }
+
+    private fun clearCurrentImages() {
+        beforeView.setImageDrawable(null)
+        afterView.setImageDrawable(null)
+        val oldResult = result
+        val oldOriginal = original
+        result = null
+        original = null
+        showingOriginal = false
+        oldResult?.let { if (it !== oldOriginal && !it.isRecycled) it.recycle() }
+        oldOriginal?.let { if (!it.isRecycled) it.recycle() }
+        saveButton.isEnabled = false
+    }
+
+    private fun setBusy(value: Boolean) {
+        busy = value
+        progressBar.visibility = if (value) View.VISIBLE else View.GONE
+        progressBar.isIndeterminate = value
+        updateEnabledState()
+    }
+
+    private fun updateEnabledState() {
+        if (!::chooseButton.isInitialized) return
+        chooseButton.isEnabled = !busy
+        enhanceButton.isEnabled = !busy && original != null
+        saveButton.isEnabled = !busy && result != null
+        resetButton.isEnabled = !busy
+        compareButton.isEnabled = !busy && result != null
+        modeGroup.isEnabled = !busy
+        for (i in 0 until modeGroup.childCount) modeGroup.getChildAt(i).isEnabled = !busy
+        strengthSeek.isEnabled = !busy
+        scaleSpinner.isEnabled = !busy
+        formatSpinner.isEnabled = !busy
+    }
+
+    override fun onDestroy() {
+        operationId++
+        worker.shutdownNow()
+        super.onDestroy()
+    }
+
+    private fun imagePanel(caption: String): ImageView = ImageView(this).apply {
+        setBackgroundColor(panel)
+        scaleType = ImageView.ScaleType.FIT_CENTER
+        contentDescription = caption
+        setPadding(dp(4), dp(4), dp(4), dp(4))
     }
 
     private fun spinner(items: List<String>): Spinner {
-        val s = Spinner(this)
-        val adapter = object : ArrayAdapter<String>(
-            this, android.R.layout.simple_spinner_item, items
-        ) {
-            override fun getView(
-                position: Int,
-                convertView: View?,
-                parent: android.view.ViewGroup
-            ): View {
-                return super.getView(position, convertView, parent).also { view ->
-                    (view as? TextView)?.apply {
-                        setTextColor(white)
-                        textSize = 14f
-                    }
+        val spinner = Spinner(this)
+        val adapter = object : ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, items) {
+            override fun getView(position: Int, convertView: View?, parent: android.view.ViewGroup): View =
+                super.getView(position, convertView, parent).also { view ->
+                    (view as? TextView)?.apply { setTextColor(white); textSize = 13f }
                 }
-            }
 
-            override fun getDropDownView(
-                position: Int,
-                convertView: View?,
-                parent: android.view.ViewGroup
-            ): View {
-                return super.getDropDownView(position, convertView, parent).also { view ->
+            override fun getDropDownView(position: Int, convertView: View?, parent: android.view.ViewGroup): View =
+                super.getDropDownView(position, convertView, parent).also { view ->
                     (view as? TextView)?.apply {
                         setTextColor(white)
                         setBackgroundColor(panel)
-                        textSize = 14f
+                        textSize = 13f
                         setPadding(dp(12), dp(12), dp(12), dp(12))
                     }
                 }
-            }
         }
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        s.adapter = adapter
-        s.setPadding(dp(8), dp(4), dp(8), dp(4))
-        return s
+        spinner.adapter = adapter
+        spinner.setPadding(dp(8), dp(4), dp(8), dp(4))
+        return spinner
     }
 
     private fun sectionTitle(text: String) = label(text, 12, muted, true).apply {
         setPadding(0, dp(18), 0, dp(8))
     }
 
-    private fun label(text: String, size: Int, color: Int, bold: Boolean): TextView =
-        TextView(this).apply {
-            this.text = text
-            textSize = size.toFloat()
-            setTextColor(color)
-            if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
-        }
+    private fun label(text: String, size: Int, color: Int, bold: Boolean): TextView = TextView(this).apply {
+        this.text = text
+        textSize = size.toFloat()
+        setTextColor(color)
+        if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
+    }
 
-    private fun button(text: String) = Button(this).apply {
+    private fun button(text: String, color: Int = purple) = Button(this).apply {
         this.text = text
         textSize = 14f
         isAllCaps = false
         setTextColor(Color.WHITE)
-        setBackgroundTintList(android.content.res.ColorStateList.valueOf(purple))
+        setBackgroundTintList(android.content.res.ColorStateList.valueOf(color))
         layoutParams = LinearLayout.LayoutParams(-1, dp(52)).apply { bottomMargin = dp(8) }
     }
 
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).roundToInt()
-    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+    private fun dp(value: Int) = (value * resources.displayMetrics.density).roundToInt()
+    private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
 
     @Deprecated("Deprecated in Android")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == 100 && resultCode == Activity.RESULT_OK) {
-            val uri: Uri = data?.data ?: return
-            try {
-                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                contentResolver.openInputStream(uri).use { stream -> BitmapFactory.decodeStream(stream, null, bounds) }
-                val sample = BitmapFactory.Options().apply {
-                    inSampleSize = calculateSample(bounds.outWidth, bounds.outHeight, 4096)
-                    inPreferredConfig = Bitmap.Config.ARGB_8888
-                }
-                contentResolver.openInputStream(uri).use { stream ->
-                    original = BitmapFactory.decodeStream(stream, null, sample) ?: throw IllegalArgumentException("Unsupported image")
-                }
-                beforeView.setImageBitmap(original)
-                afterView.setImageDrawable(null)
-                result = null
-                saveButton.isEnabled = false
-                status.text = "Image loaded • ${original!!.width} × ${original!!.height} px"
-            } catch (e: Exception) {
-                status.text = "Image open failed: ${e.message ?: "unknown error"}"
+        if (requestCode == REQUEST_PICK_IMAGE) {
+            if (resultCode == Activity.RESULT_OK) {
+                val uri = data?.data
+                if (uri != null) loadImage(uri) else status.text = "No image was selected."
+            }
+        } else if (requestCode == REQUEST_SAVE_IMAGE) {
+            val bitmap = pendingSaveBitmap
+            val uri = data?.data
+            if (resultCode == Activity.RESULT_OK && uri != null && bitmap != null) {
+                status.text = "Saving image…"
+                writeImage(uri, bitmap)
+            } else {
+                pendingSaveBitmap = null
+                setBusy(false)
+                status.text = "Save cancelled."
             }
         }
+    }
+
+    companion object {
+        private const val REQUEST_PICK_IMAGE = 100
+        private const val REQUEST_SAVE_IMAGE = 101
     }
 }
